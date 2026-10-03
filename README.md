@@ -9,7 +9,7 @@ cargo run --release
 
 Параметры окружения:
 
-- `DATS_SERVER_URL` — origin HTTP-сервера, например `http://127.0.0.1:8080`.
+- `DATS_SERVER_URL` — HTTP- или HTTPS-origin без пути, например `http://127.0.0.1:8080` или `https://stadmagic.example`.
 - `DATS_PLAYER_TOKEN` — токен напрямую из окружения (приоритетнее файла).
 - `DATS_PLAYER_TOKEN_FILE` — путь к токену (по умолчанию `token.txt`, используется если `DATS_PLAYER_TOKEN` не задан).
 - `DATS_PLAN_HORIZON_SECONDS` — горизонт сканирования в секундах (по умолчанию 30 для `stable-profit`; для `agile-top1` по умолчанию 15 и ограничен сверху 15).
@@ -27,6 +27,6 @@ DATS_PLAYER_STRATEGY=agile-top1 DATS_MOVEMENT_STRATEGY=survival DATS_DOOM_POLICY
 DATS_PLAYER_TOKEN='none_top1' DATS_PLAYER_STRATEGY=agile-top1 DATS_MOVEMENT_STRATEGY=none cargo run --release
 ```
 
-Минимальный встроенный HTTP-клиент принимает только `http://` origin без пути; это подходит для локального Rust-сервера и не тянет TLS/HTTP-крейты в отдельный бинарник.
+Встроенный клиент поддерживает HTTP и HTTPS. Для HTTPS он проверяет TLS-сертификат и имя хоста по стандартному набору публичных корневых сертификатов; отключать проверку сертификата не нужно.
 
 Клиент использует только `POST /play/magcarp/player/move`. Он измеряет RTT, плавно учитывает задержку перед применением команды и ограничивает частоту запросов одним запросом с командами на игровой тик. Каждый живой транспорт получает вектор длины `maxAccel`.

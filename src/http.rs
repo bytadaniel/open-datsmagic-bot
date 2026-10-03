@@ -1,19 +1,22 @@
 use flate2::read::GzDecoder;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 
 const ENDPOINT: &str = "/play/magcarp/player/move";
 
 pub fn post_desert(base_url: &str, token: &str, payload: &Value) -> Result<(u16, String), String> {
-    let (authority, host, port) = parse_http_origin(base_url)?;
-    let address = if host.contains(':') {
-        format!("[{host}]:{port}")
+    let origin = parse_server_origin(base_url)?;
+    let address = if origin.host.contains(':') {
+        format!("[{}]:{}", origin.host, origin.port)
     } else {
-        format!("{host}:{port}")
+        format!("{}:{}", origin.host, origin.port)
     };
-    let mut stream = TcpStream::connect(&address).map_err(|e| format!("connect {address}: {e}"))?;
+    let stream = TcpStream::connect(&address).map_err(|e| format!("connect {address}: {e}"))?;
     let timeout = Some(Duration::from_secs(3));
     stream
         .set_read_timeout(timeout)
@@ -22,52 +25,113 @@ pub fn post_desert(base_url: &str, token: &str, payload: &Value) -> Result<(u16,
         .set_write_timeout(timeout)
         .map_err(|e| e.to_string())?;
 
+    let mut stream: Box<dyn ReadWrite> = if origin.tls {
+        let server_name = ServerName::try_from(origin.host.clone())
+            .map_err(|error| format!("invalid HTTPS server name {}: {error}", origin.host))?;
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connection = ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|error| format!("start TLS with {}: {error}", origin.host))?;
+        Box::new(StreamOwned::new(connection, stream))
+    } else {
+        Box::new(stream)
+    };
+
     let body = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let request = format!(
-        "POST {ENDPOINT} HTTP/1.1\r\nHost: {authority}\r\nX-Auth-Token: {token}\r\nContent-Type: application/json\r\nAccept: application/json\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {ENDPOINT} HTTP/1.1\r\nHost: {}\r\nX-Auth-Token: {token}\r\nContent-Type: application/json\r\nAccept: application/json\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        origin.authority,
         body.len()
     );
     stream
         .write_all(request.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.write_all(&body).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("send request to {base_url}: {e}"))?;
+    stream
+        .write_all(&body)
+        .map_err(|e| format!("send request body to {base_url}: {e}"))?;
 
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("read response from {base_url}: {e}"))?;
     decode_response(&response)
 }
 
-fn parse_http_origin(url: &str) -> Result<(String, String, u16), String> {
-    let authority = url
-        .strip_prefix("http://")
-        .ok_or_else(|| {
-            "only http:// server origins are supported by this minimal client".to_string()
-        })?
-        .trim_end_matches('/');
-    if authority.is_empty() || authority.contains('/') || authority.contains('@') {
-        return Err("DATS_SERVER_URL must be an http origin without a path or user info".into());
+#[derive(Debug, PartialEq, Eq)]
+struct ServerOrigin {
+    authority: String,
+    host: String,
+    port: u16,
+    tls: bool,
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+fn parse_server_origin(url: &str) -> Result<ServerOrigin, String> {
+    let (tls, raw_authority, default_port) = if let Some(authority) = url.strip_prefix("http://") {
+        (false, authority, 80)
+    } else if let Some(authority) = url.strip_prefix("https://") {
+        (true, authority, 443)
+    } else {
+        return Err("DATS_SERVER_URL must start with http:// or https://".into());
+    };
+    let authority = raw_authority.trim_end_matches('/');
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('@')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.chars().any(char::is_whitespace)
+    {
+        return Err("DATS_SERVER_URL must be an origin without path, query, or user info".into());
     }
 
     if authority.starts_with('[') {
         let close = authority.find(']').ok_or("invalid IPv6 server origin")?;
         let host = authority[1..close].to_string();
-        let port = authority[close + 1..]
-            .strip_prefix(':')
-            .map(str::parse::<u16>)
-            .transpose()
-            .map_err(|_| "invalid server port")?
-            .unwrap_or(80);
-        return Ok((authority.to_string(), host, port));
+        let port_suffix = &authority[close + 1..];
+        let port = if port_suffix.is_empty() {
+            default_port
+        } else {
+            port_suffix
+                .strip_prefix(':')
+                .ok_or("invalid IPv6 server origin")?
+                .parse::<u16>()
+                .map_err(|_| "invalid server port")?
+        };
+        return Ok(ServerOrigin {
+            authority: authority.to_string(),
+            host,
+            port,
+            tls,
+        });
     }
 
     if let Some((host, raw_port)) = authority.rsplit_once(':') {
-        if let Ok(port) = raw_port.parse::<u16>() {
-            return Ok((authority.to_string(), host.to_string(), port));
+        if host.contains(':') {
+            return Err("IPv6 server origins must use brackets".into());
         }
+        let port = raw_port.parse::<u16>().map_err(|_| "invalid server port")?;
+        if host.is_empty() {
+            return Err("DATS_SERVER_URL host is empty".into());
+        }
+        return Ok(ServerOrigin {
+            authority: authority.to_string(),
+            host: host.to_string(),
+            port,
+            tls,
+        });
     }
-    Ok((authority.to_string(), authority.to_string(), 80))
+
+    Ok(ServerOrigin {
+        authority: authority.to_string(),
+        host: authority.to_string(),
+        port: default_port,
+        tls,
+    })
 }
 
 fn decode_response(response: &[u8]) -> Result<(u16, String), String> {
@@ -141,11 +205,37 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_chunked, decode_response, parse_http_origin};
+    use super::{decode_chunked, decode_response, parse_server_origin};
 
     #[test]
     fn parses_localhost_origin() {
-        assert_eq!(parse_http_origin("http://127.0.0.1:8080").unwrap().2, 8080);
+        let origin = parse_server_origin("http://127.0.0.1:8080").unwrap();
+        assert_eq!(origin.port, 8080);
+        assert!(!origin.tls);
+    }
+
+    #[test]
+    fn parses_https_origin_with_default_tls_port() {
+        let origin = parse_server_origin("https://stadmagic.strangled.net/").unwrap();
+        assert_eq!(origin.authority, "stadmagic.strangled.net");
+        assert_eq!(origin.host, "stadmagic.strangled.net");
+        assert_eq!(origin.port, 443);
+        assert!(origin.tls);
+    }
+
+    #[test]
+    fn parses_https_origin_with_explicit_port() {
+        let origin = parse_server_origin("https://arena.example:8443").unwrap();
+        assert_eq!(origin.port, 8443);
+        assert!(origin.tls);
+    }
+
+    #[test]
+    fn rejects_server_urls_that_are_not_origins() {
+        assert!(parse_server_origin("https://arena.example/play").is_err());
+        assert!(parse_server_origin("ftp://arena.example").is_err());
+        assert!(parse_server_origin("https://user@arena.example").is_err());
+        assert!(parse_server_origin("https://arena.example:nope").is_err());
     }
 
     #[test]
