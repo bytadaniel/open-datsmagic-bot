@@ -3,7 +3,7 @@
 Отдельный автономный клиент; он не входит в бинарник сервера. По умолчанию подключается к `http://127.0.0.1:8080` и читает `X-Auth-Token` из `token.txt`.
 
 ```sh
-cd lib/bot-variants/player_2
+cd lib/arena-bots/rust_bytadaniel
 cargo run --release
 ```
 
