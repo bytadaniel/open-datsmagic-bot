@@ -35,6 +35,7 @@ pub enum Strategy {
     #[default]
     StableProfit,
     AgileTop1,
+    Top1V2,
 }
 
 impl Strategy {
@@ -42,8 +43,9 @@ impl Strategy {
         match value.trim() {
             "stable-profit" => Ok(Self::StableProfit),
             "agile-top1" => Ok(Self::AgileTop1),
+            "top1-v2" => Ok(Self::Top1V2),
             other => Err(format!(
-                "unknown player strategy '{other}'; expected 'stable-profit' or 'agile-top1'"
+                "unknown player strategy '{other}'; expected 'stable-profit', 'agile-top1', or 'top1-v2'"
             )),
         }
     }
@@ -52,21 +54,26 @@ impl Strategy {
         match self {
             Self::StableProfit => "stable-profit",
             Self::AgileTop1 => "agile-top1",
+            Self::Top1V2 => "top1-v2",
         }
     }
 
     pub fn default_horizon(self) -> f64 {
         match self {
             Self::StableProfit => 30.0,
-            Self::AgileTop1 => 15.0,
+            Self::AgileTop1 | Self::Top1V2 => 15.0,
         }
     }
 
     fn limit_horizon(self, horizon: f64) -> f64 {
         match self {
             Self::StableProfit => horizon.max(TICK),
-            Self::AgileTop1 => horizon.clamp(TICK, 15.0),
+            Self::AgileTop1 | Self::Top1V2 => horizon.clamp(TICK, 15.0),
         }
+    }
+
+    fn is_top1_v2(self) -> bool {
+        self == Self::Top1V2
     }
 }
 
@@ -356,12 +363,12 @@ impl Bot {
 
         for transport in transports {
             let mut carpet_evaluations = 0;
-            let memo = if self.strategy == Strategy::StableProfit {
+            let memo = if self.strategy == Strategy::StableProfit || self.strategy.is_top1_v2() {
                 self.plans.get(&transport.id).cloned().unwrap_or_default()
             } else {
                 PlanMemo::default()
             };
-            let mut bounties = if self.strategy == Strategy::AgileTop1 {
+            let mut bounties = if self.strategy != Strategy::StableProfit {
                 desert.bounties.clone()
             } else {
                 shortlist_bounties(transport.position, &desert.bounties, &reserved_targets)
@@ -388,12 +395,12 @@ impl Bot {
                 .target
                 .as_ref()
                 .filter(|target| contains_bounty(&bounties, target));
-            let bounty_grid = (self.strategy == Strategy::AgileTop1)
+            let bounty_grid = (self.strategy != Strategy::StableProfit)
                 .then(|| BountyGrid::new(&bounties, desert.transport_radius));
             let mut stalled_ticks = memo.stalled_ticks;
             // The next command is sent on the next polling slot, then waits for the
             // server tick boundary. Include both cadence/phase and observed network RTT.
-            let delay = if self.strategy == Strategy::AgileTop1 {
+            let delay = if self.strategy != Strategy::StableProfit {
                 0.3
             } else {
                 (self.rtt_ewma + TICK * 0.5).clamp(TICK * 1.5, 0.8)
@@ -443,13 +450,15 @@ impl Bot {
                 trajectory_evaluations += carpet_evaluations;
                 Some(course)
             } else {
-                let scan_origin = if self.strategy == Strategy::AgileTop1 {
+                let scan_origin = if self.strategy != Strategy::StableProfit {
                     0.0
                 } else {
                     forward_heading(transport, desert)
                 };
                 let mut coarse_angles = if self.strategy == Strategy::AgileTop1 {
                     full_circle_angles(0.0, AGILE_SCAN_ANGLE_STEP_DEG)
+                } else if self.strategy.is_top1_v2() {
+                    full_circle_angles(0.0, SCAN_ANGLE_STEP_DEG)
                 } else {
                     primary_scan_angles(scan_origin)
                 };
@@ -478,23 +487,29 @@ impl Bot {
                 carpet_evaluations += coarse_angles.len();
 
                 let mut fine_angles = Vec::new();
-                if self.strategy == Strategy::StableProfit {
+                if self.strategy == Strategy::StableProfit || self.strategy.is_top1_v2() {
                     // Rank candidates from the full-circle pass, then spend fine-grained
                     // simulation only around a few separated local basins.
-                    let seeds = refinement_seeds(&evaluations);
+                    let seeds = if self.strategy.is_top1_v2() {
+                        refinement_seeds_by(&evaluations, compare_agile_top1)
+                    } else {
+                        refinement_seeds(&evaluations)
+                    };
                     for seed in seeds {
                         for angle in refinement_angles(seed) {
                             push_unique(&mut fine_angles, angle);
                         }
                     }
-                    if let Some(previous) = memo.angle {
-                        let covered = fine_angles.iter().any(|angle| {
-                            angular_delta(*angle, previous).abs()
-                                <= REFINE_ANGLE_STEP_DEG.to_radians() * 0.51
-                        });
-                        if !covered {
-                            for angle in refinement_angles(previous) {
-                                push_unique(&mut fine_angles, angle);
+                    if self.strategy == Strategy::StableProfit {
+                        if let Some(previous) = memo.angle {
+                            let covered = fine_angles.iter().any(|angle| {
+                                angular_delta(*angle, previous).abs()
+                                    <= REFINE_ANGLE_STEP_DEG.to_radians() * 0.51
+                            });
+                            if !covered {
+                                for angle in refinement_angles(previous) {
+                                    push_unique(&mut fine_angles, angle);
+                                }
                             }
                         }
                     }
@@ -531,7 +546,7 @@ impl Bot {
                 let mut selected = evaluations
                     .iter()
                     .max_by(|a, b| {
-                        if self.strategy == Strategy::AgileTop1 {
+                        if self.strategy != Strategy::StableProfit {
                             compare_agile_top1(a, b)
                         } else {
                             compare_success(a, b)
@@ -566,7 +581,10 @@ impl Bot {
                 .is_some()
                 .then(|| memo.resume_angle.zip(memo.resume_target))
                 .flatten();
-            if let Some(held) = best.as_ref().filter(|_| was_holding_course) {
+            if let Some(held) = best
+                .as_ref()
+                .filter(|_| was_holding_course && self.strategy == Strategy::StableProfit)
+            {
                 // During a committed route, cheaply inspect a short tactical horizon for a
                 // materially better immediate capture. The full horizon is still used to
                 // validate every refined detour candidate, especially for survival.
@@ -778,7 +796,7 @@ impl Bot {
             if let Some(target) = &target {
                 reserved_targets.push(target.position);
             }
-            if self.strategy == Strategy::StableProfit {
+            if self.strategy == Strategy::StableProfit || self.strategy.is_top1_v2() {
                 self.plans.insert(
                     transport.id.clone(),
                     PlanMemo {
@@ -1668,6 +1686,13 @@ fn refinement_angles(center: f64) -> Vec<f64> {
 }
 
 fn refinement_seeds(evaluations: &[Evaluation]) -> Vec<f64> {
+    refinement_seeds_by(evaluations, compare_success)
+}
+
+fn refinement_seeds_by(
+    evaluations: &[Evaluation],
+    compare: impl Fn(&Evaluation, &Evaluation) -> Ordering,
+) -> Vec<f64> {
     let min_separation = (REFINE_HALF_WIDTH_DEG * 2.0).to_radians();
     let mut seeds = Vec::with_capacity(MAX_REFINEMENT_SEEDS);
     while seeds.len() < MAX_REFINEMENT_SEEDS {
@@ -1678,7 +1703,7 @@ fn refinement_seeds(evaluations: &[Evaluation]) -> Vec<f64> {
                     .iter()
                     .all(|seed: &f64| angular_delta(*seed, candidate.angle).abs() >= min_separation)
             })
-            .max_by(|a, b| compare_success(a, b));
+            .max_by(|a, b| compare(a, b));
         let Some(candidate) = next else { break };
         seeds.push(candidate.angle);
     }
@@ -2465,16 +2490,62 @@ mod tests {
     }
 
     #[test]
+    fn top1_v2_refines_coarse_scan_and_holds_then_replans_after_collection() {
+        let target = Bounty {
+            position: Vec2 { x: 700.0, y: 500.0 },
+            points: 500.0,
+            radius: 5.0,
+        };
+        let mut desert = empty_desert();
+        desert.map_size = Vec2 {
+            x: 5_000.0,
+            y: 5_000.0,
+        };
+        desert.transports.push(Transport {
+            id: "v2".into(),
+            position: Vec2 { x: 500.0, y: 500.0 },
+            velocity: Vec2 { x: 40.0, y: 0.0 },
+            self_acceleration: Vec2::default(),
+            anomaly_acceleration: Vec2::default(),
+            alive: true,
+        });
+        desert.bounties.push(target.clone());
+        let mut bot = Bot::with_strategy(30.0, Strategy::Top1V2);
+        assert_eq!(bot.horizon, 15.0);
+
+        let first = bot.plan(&desert);
+        assert!(first.trajectory_evaluations < 220);
+        assert!(bot.plans["v2"]
+            .target
+            .as_ref()
+            .is_some_and(|t| same_bounty(t, &target)));
+        let selected_angle = bot.plans["v2"].angle.unwrap();
+
+        // The snapshot still predicts this target on the committed route.
+        let held = bot.plan(&desert);
+        assert_eq!(held.trajectory_evaluations, 1);
+        assert!(super::angular_delta(bot.plans["v2"].angle.unwrap(), selected_angle).abs() < 1e-9);
+
+        // The next snapshot confirms collection, so the following target is selected afresh.
+        desert.bounties.clear();
+        let replanned = bot.plan(&desert);
+        assert!(replanned.trajectory_evaluations > 1);
+        assert!(bot.plans["v2"].target.is_none());
+    }
+
+    #[test]
     fn strategy_names_are_explicit_and_unknown_values_are_rejected() {
         assert_eq!(
             Strategy::parse("stable-profit").unwrap(),
             Strategy::StableProfit
         );
         assert_eq!(Strategy::parse("agile-top1").unwrap(), Strategy::AgileTop1);
+        assert_eq!(Strategy::parse("top1-v2").unwrap(), Strategy::Top1V2);
         assert!(Strategy::parse("typo").is_err());
         assert_eq!(Strategy::default(), Strategy::StableProfit);
         assert_eq!(Bot::new(10.0).strategy, Strategy::StableProfit);
         assert_eq!(Bot::with_strategy(8.0, Strategy::AgileTop1).horizon, 8.0);
+        assert_eq!(Bot::with_strategy(30.0, Strategy::Top1V2).horizon, 15.0);
     }
 
     #[test]

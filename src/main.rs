@@ -46,7 +46,7 @@ fn run() -> Result<(), String> {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= TICK_SECONDS)
         .unwrap_or_else(|| strategy.default_horizon());
-    let horizon = if strategy == Strategy::AgileTop1 {
+    let horizon = if strategy == Strategy::AgileTop1 || strategy == Strategy::Top1V2 {
         horizon.min(15.0)
     } else {
         horizon
